@@ -116,17 +116,19 @@ func (provider *SessionProvider) InitiateChannelImplicit(transmitter APDUTransmi
 
 	channelID := getChannelID(capdu.Cla)
 
+	macEncrypter, err := provider.keyProvider.GetKey(KeyIDMac, keyVersionNumber)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to retrieve provider for MAC key")
+	}
+
 	session := newSession(channelID, sequenceCounter, provider.securityLevel, provider.options)
 	session.selectedAid = selectedAid
 	// C-DEC is not supported for implicit initiation
 	session.securityLevel.CDEC = false
 
-	macProvider, err := provider.keyProvider.GetKey(KeyIDMac, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve provider for MAC key")
-	}
+	session.macEncrypter = macEncrypter
 
-	err = deriveSessionKey(&session.keys.cmac, macProvider, [2]byte{0x01, 0x01}, sequenceCounter)
+	err = deriveSessionKey(&session.keys.cmac, session.macEncrypter, [2]byte{0x01, 0x01}, sequenceCounter)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive C-MAC session key")
 	}
