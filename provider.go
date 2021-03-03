@@ -81,16 +81,15 @@ type SessionProvider struct {
 }
 
 // NewSessionProvider returns a SessionProvider. It panics if the value of KeyProvider is nil.
-func NewSessionProvider(provider KeyProvider, level SecurityLevel, options Options, useFirstAvailableSDKeyVersion bool) *SessionProvider {
+func NewSessionProvider(provider KeyProvider, level SecurityLevel, options Options) *SessionProvider {
 	if isNil(provider) {
 		panic("value of provider must not be nil")
 	}
 
 	return &SessionProvider{
-		keyProvider:                   provider,
-		securityLevel:                 level,
-		options:                       options,
-		useFirstAvailableSDKeyVersion: useFirstAvailableSDKeyVersion,
+		keyProvider:   provider,
+		securityLevel: level,
+		options:       options,
 	}
 }
 
