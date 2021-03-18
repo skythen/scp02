@@ -1,18 +1,8 @@
 package scp02
 
-import (
-	"reflect"
-)
-
-func isNil(v interface{}) bool {
-	return v == nil || (reflect.ValueOf(v).Kind() == reflect.Ptr && reflect.ValueOf(v).IsNil())
-}
-
 func onLogicalChannel(channelID, cla byte) byte {
 	if channelID <= 3 {
-		cla = cla | channelID
-
-		return cla
+		return cla | channelID
 	}
 
 	if cla&0x40 != 0x40 {
@@ -25,12 +15,10 @@ func onLogicalChannel(channelID, cla byte) byte {
 
 	channelID -= 4
 
-	cla = cla | (channelID & 0x0F)
-
-	return cla
+	return cla | (channelID & 0x0F)
 }
 
-func getChannelID(cla byte) byte {
+func channelIDFromCLA(cla byte) byte {
 	var channelID byte
 
 	if cla&0x40 != 0x40 {
