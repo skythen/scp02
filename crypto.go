@@ -3,12 +3,13 @@ package scp02
 import (
 	"crypto/cipher"
 	"crypto/des"
+
 	"github.com/pkg/errors"
 )
 
-// Pad80 takes data and a block size (must be a multiple of 8) and appends '80' and zero bytes to data until
-// the length of the resulting []byte reaches a multiple of the block size and returns the padded data.
-// If force is false, the padding will only be applied, if length of data is not a multiple of the block size.
+// Pad80 takes Data and a block size (must be a multiple of 8) and appends '80' and zero bytes to Data until
+// the length of the resulting []byte reaches a multiple of the block size and returns the padded Data.
+// If force is false, the padding will only be applied, if length of Data is not a multiple of the block size.
 // If force is true, the padding will be applied anyways.
 func Pad80(b []byte, blocksize int, force bool) ([]byte, error) {
 	if blocksize%8 != 0 {

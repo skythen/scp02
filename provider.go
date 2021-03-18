@@ -2,8 +2,9 @@ package scp02
 
 import (
 	"bytes"
-	"crypto/des"
 	"fmt"
+	"sync"
+
 	"github.com/pkg/errors"
 	"github.com/skythen/apdu"
 )
@@ -17,25 +18,17 @@ const (
 	KeyIDDek byte = 0x03
 )
 
-// APDUTransmitter is the interface that transmits apdu.Capdu and returns apdu.Rapdu.
-type APDUTransmitter interface {
+// Transmitter is the interface that transmits apdu.Capdu and returns apdu.Rapdu.
+type Transmitter interface {
 	Transmit(capdu apdu.Capdu) (apdu.Rapdu, error)
 }
 
-// KeyProvider is the interface that provides access to static keys for SCP02.
-type KeyProvider interface {
-	// GetKey returns the TripleDESCBCEncrypter for a static DES key with the given key ID and key version number.
-	// Key ID and key version number uniquely identify a key within the context of a Security Domain.
-	// The AID of the Security Domain is implicitly known.
-	GetKey(keyID byte, kvn byte) (TripleDESCBCEncrypter, error)
-}
-
-// TripleDESCBCEncrypter is the interface that provides access to the cryptographic operation for session key derivation.
-type TripleDESCBCEncrypter interface {
-	// Encrypt uses Triple DES in CBC mode for the derivation of session keys with src containing
-	// the derivation input data (2B derivation constant | 2B sequence counter | 12B zero padding)
+// SessionKeyProvider is the interface that provides access to the cryptographic operation for session key derivation.
+type SessionKeyProvider interface {
+	// ProvideSessionKey uses Triple DES encryption in CBC mode for the derivation of session keys with src containing
+	// the derivation input Data (2B derivation constant | 2B sequence counter | 12B zero padding)
 	// and dst being used for storing the encryption result.
-	Encrypt(dst *[16]byte, src [16]byte) error
+	ProvideSessionKey(keyID byte, kvn byte, dst *[16]byte, src [16]byte) error
 }
 
 // SecurityLevel represents the security level options applicable for SCP02.
@@ -72,29 +65,18 @@ type Options struct {
 	ICVEncryptionForCMAC bool // true: ICV encryption for C-MAC session, false: No ICV encryption
 }
 
-// SessionProvider is used for initiating a SCP02 Session or RMACSession.
-type SessionProvider struct {
-	keyProvider                   KeyProvider
-	securityLevel                 SecurityLevel
-	options                       Options
-	useFirstAvailableSDKeyVersion bool
-}
-
-// NewSessionProvider returns a SessionProvider. It panics if the value of KeyProvider is nil.
-func NewSessionProvider(provider KeyProvider, level SecurityLevel, options Options) *SessionProvider {
-	if isNil(provider) {
-		panic("value of provider must not be nil")
-	}
-
-	return &SessionProvider{
-		keyProvider:   provider,
-		securityLevel: level,
-		options:       options,
-	}
+// ImplicitInitiationConfiguration is the configuration for the implicit initiation of a Secure Channel Session.
+type ImplicitInitiationConfiguration struct {
+	SecurityLevel    SecurityLevel
+	Options          Options
+	KeyVersionNumber uint8
+	SequenceCounter  uint16
+	Capdu            apdu.Capdu
+	SelectedAid      []byte
 }
 
 // InitiateChannelImplicit uses implicit initiation to create a Secure Channel and returns a Session.
-// The function will panic if the value of APDUTransmitter is nil.
+// The function will panic if the value of Transmitter is nil.
 //
 // Please note that C-DEC is not supported for implicit initiation and will not be used if it was
 // provided with the Security Level in the SessionProvider Configuration.
@@ -104,39 +86,44 @@ func NewSessionProvider(provider KeyProvider, level SecurityLevel, options Optio
 // the given channel is used for calculating the ICV for the first C-MAC (ICV MAC over AID).
 //
 // The first C-MAC is calculated on and appended to the given APDU which is then passed to
-// APDUTransmitter.Transmit.
-func (provider *SessionProvider) InitiateChannelImplicit(transmitter APDUTransmitter, keyVersionNumber byte, sequenceCounter [2]byte, capdu apdu.Capdu, selectedAid []byte) (*Session, error) {
+// Transmitter.Transmit.
+func InitiateChannelImplicit(keyProvider SessionKeyProvider, transmitter Transmitter, config ImplicitInitiationConfiguration) (*Session, error) {
 	if isNil(transmitter) {
-		panic("value of transmitter must not be nil")
+		panic("value of inputTransmitter must not be nil")
 	}
 
-	if selectedAid != nil && len(selectedAid) < 5 || len(selectedAid) > 16 {
-		return nil, errors.Errorf("invalid length of AID - must be in range 5-16 bytes, got: %d", len(selectedAid))
+	if isNil(keyProvider) {
+		panic("value of keyProvider must not be nil")
 	}
 
-	channelID := getChannelID(capdu.Cla)
-
-	macEncrypter, err := provider.keyProvider.GetKey(KeyIDMac, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve provider for MAC key")
+	if config.SelectedAid != nil && len(config.SelectedAid) < 5 || len(config.SelectedAid) > 16 {
+		return nil, errors.Errorf("invalid length of AID - must be in range 5-16 bytes, got: %d", len(config.SelectedAid))
 	}
 
-	session := newSession(channelID, sequenceCounter, provider.securityLevel, provider.options)
-	session.selectedAid = selectedAid
+	channelID := getChannelID(config.Capdu.Cla)
+
+	session := newSession(
+		channelID,
+		config.KeyVersionNumber,
+		uint16ToBytes(config.SequenceCounter),
+		config.SecurityLevel,
+		config.Options)
+
+	session.selectedAID = config.SelectedAid
 	// C-DEC is not supported for implicit initiation
 	session.securityLevel.CDEC = false
 
-	session.macEncrypter = macEncrypter
+	session.sessionKeyProvider = keyProvider
 
-	err = deriveSessionKey(&session.keys.cmac, session.macEncrypter, [2]byte{0x01, 0x01}, sequenceCounter)
+	err := session.deriveCMAC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive C-MAC session key")
 	}
 
-	// pad data
-	padded, err := Pad80(selectedAid, 8, true)
+	// pad Data
+	padded, err := Pad80(config.SelectedAid, 8, true)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to pad data for CMAC calculation")
+		return nil, errors.Wrap(err, "failed to pad Data for CMAC calculation")
 	}
 
 	// calculate ICV Mac over AID
@@ -145,7 +132,7 @@ func (provider *SessionProvider) InitiateChannelImplicit(transmitter APDUTransmi
 		return nil, errors.Wrap(err, "failed to calculate CMAC with Single DES Final 3DES MAC")
 	}
 
-	wrapped, err := session.wrapWithSecurityLevel(capdu, provider.securityLevel, true)
+	wrapped, err := session.wrapWithSecurityLevel(config.Capdu, session.securityLevel, true)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to wrap CAPDU")
 	}
@@ -163,48 +150,62 @@ func (provider *SessionProvider) InitiateChannelImplicit(transmitter APDUTransmi
 
 	session.incrementSequenceCounter()
 
-	dekProvider, err := provider.keyProvider.GetKey(KeyIDDek, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve provider for DEK key")
-	}
-
 	// derive DEK and R-MAC after sequence counter incrementation
-	err = session.deriveDEK(dekProvider)
+	err = session.deriveDEK()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive DEK session key")
 	}
 
 	// since an R-MAC session can be initiated at any given time, derive R-MAC as well
-	err = session.deriveRMAC(session.macEncrypter)
+	err = session.deriveRMAC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive R-MAC session key")
 	}
 
 	// check for RMAC
 	if session.securityLevel.RMAC {
-		rmacSession := &RMACSession{}
-		copy(rmacSession.rmac[:], session.keys.rmac[:])
-		copy(rmacSession.ricv[:], capdu.Data[len(capdu.Data)-8:])
+		rmacSession := &RMACSession{
+			channelID:   session.channelID,
+			lastCommand: nil,
+			ricv:        [8]byte{},
+			rmac:        session.keys.rmac,
+			lock:        sync.Mutex{},
+		}
+
+		copy(rmacSession.ricv[:], wrapped.Data[len(wrapped.Data)-8:])
 		session.rmacSession = rmacSession
 	}
 
 	return session, nil
 }
 
+// ExplicitInitiationConfiguration is the configuration for the explicit initiation of a Secure Channel Session.
+type ExplicitInitiationConfiguration struct {
+	SecurityLevel    SecurityLevel
+	Options          Options
+	ChannelID        uint8
+	KeyVersionNumber uint8
+	HostChallenge    [8]byte
+}
+
 // InitiateChannelExplicit uses implicit initiation to create a Secure Channel and returns a Session.
-// The function will panic if the value of APDUTransmitter is nil.
+// The function will panic if the value of Transmitter is nil.
 //
-// This function calls APDUTransmitter.Transmit to transmit the INITIALIZE UPDATE and
+// This function calls Transmitter.Transmit to transmit the INITIALIZE UPDATE and
 // EXTERNAL AUTHENTICATE CAPDUs and receive the RAPDUs.
-func (provider *SessionProvider) InitiateChannelExplicit(transmitter APDUTransmitter, channelID, keyVersionNumber byte, hostChallenge [8]byte) (*Session, error) {
+func InitiateChannelExplicit(transmitter Transmitter, keyProvider SessionKeyProvider, config ExplicitInitiationConfiguration) (*Session, error) {
 	if isNil(transmitter) {
 		panic("value of transmitter must not be nil")
 	}
 
-	kvn := keyVersionNumber
+	if isNil(keyProvider) {
+		panic("value of keyProvider must not be nil")
+	}
 
-	capdu := initializeUpdate(kvn, hostChallenge)
-	capdu.Cla = onLogicalChannel(channelID, capdu.Cla)
+	kvn := config.KeyVersionNumber
+
+	capdu := initializeUpdate(kvn, config.HostChallenge)
+	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err := transmitter.Transmit(capdu)
 	if err != nil {
@@ -220,49 +221,35 @@ func (provider *SessionProvider) InitiateChannelExplicit(transmitter APDUTransmi
 		return nil, errors.Wrap(err, "invalid INITIALIZE UPDATE response")
 	}
 
-	encEncrypter, err := provider.keyProvider.GetKey(KeyIDEnc, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve encrypter for ENC key")
-	}
-
-	macEncrypter, err := provider.keyProvider.GetKey(KeyIDMac, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve encrypter for MAC key")
-	}
-
-	dekEncrypter, err := provider.keyProvider.GetKey(KeyIDDek, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve encrypter for DEK key")
-	}
-
-	session := newSession(channelID, iur.SequenceCounter, provider.securityLevel, provider.options)
+	session := newSession(config.ChannelID, config.KeyVersionNumber, iur.SequenceCounter, config.SecurityLevel, config.Options)
+	session.sessionKeyProvider = keyProvider
 
 	// derive session keys
 	// ENC
-	err = session.deriveENC(encEncrypter)
+	err = session.deriveENC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive session ENC")
 	}
 
 	// CMAC
-	err = session.deriveCMAC(macEncrypter)
+	err = session.deriveCMAC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive C-MAC")
 	}
 
 	// RMAC
-	err = session.deriveRMAC(macEncrypter)
+	err = session.deriveRMAC()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive R-MAC")
 	}
 
 	// DEK
-	err = session.deriveDEK(dekEncrypter)
+	err = session.deriveDEK()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive session DEK")
 	}
 
-	cc, err := session.calculateCardCryptogram(hostChallenge, iur.SequenceCounter, iur.CardChallenge)
+	cc, err := session.calculateCardCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to calculate card cryptogram on host")
 	}
@@ -272,7 +259,7 @@ func (provider *SessionProvider) InitiateChannelExplicit(transmitter APDUTransmi
 		return nil, fmt.Errorf("calculated card cryptogram on host %02X doesn't match the calculated cryptogram of the card %02X", cc, iur.CardCryptogram)
 	}
 
-	hc, err := session.calculateHostCryptogram(hostChallenge, iur.SequenceCounter, iur.CardChallenge)
+	hc, err := session.calculateHostCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to calculate host cryptogram")
 	}
@@ -282,7 +269,7 @@ func (provider *SessionProvider) InitiateChannelExplicit(transmitter APDUTransmi
 		return nil, errors.Wrap(err, "failed to generate EXTERNAL AUTHENTICATE command")
 	}
 
-	capdu.Cla = onLogicalChannel(channelID, capdu.Cla)
+	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err = transmitter.Transmit(capdu)
 	if err != nil {
@@ -293,57 +280,69 @@ func (provider *SessionProvider) InitiateChannelExplicit(transmitter APDUTransmi
 		return nil, errors.Errorf("EXTERNAL AUTHENTICATE failed with SW: %02X%02X", resp.SW1, resp.SW2)
 	}
 
-	session.externalAuthenticateCmac = capdu.Data[8:]
+	session.externalAuthenticateCMAC = capdu.Data[8:]
 	session.incrementSequenceCounter()
 
 	// check for RMAC
 	if session.securityLevel.RMAC {
-		rmacSession := &RMACSession{}
-		copy(rmacSession.rmac[:], session.keys.rmac[:])
-		copy(rmacSession.ricv[:], session.externalAuthenticateCmac)
+		rmacSession := &RMACSession{
+			channelID:   session.channelID,
+			lastCommand: nil,
+			ricv:        [8]byte{},
+			rmac:        session.keys.rmac,
+			lock:        sync.Mutex{},
+		}
+		copy(rmacSession.ricv[:], session.externalAuthenticateCMAC)
 		session.rmacSession = rmacSession
 	}
 
 	return session, nil
 }
 
+// ExplicitInitiationConfiguration is the configuration for the explicit initiation of a Secure Channel Session.
+type RMACSessionConfiguration struct {
+	ChannelID        uint8
+	P1               byte
+	Data             []byte
+	KeyVersionNumber uint8
+	SequenceCounter  uint16
+}
+
 // BeginRMACSession begins a R-MAC session and returns a RMACSession.
-// The function will panic if the value of APDUTransmitter is nil.
-//
-// This function calls APDUTransmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
-func (provider *SessionProvider) BeginRMACSession(transmitter APDUTransmitter, channelID, p1 byte, data []byte, keyVersionNumber byte, sequenceCounter [2]byte) (*RMACSession, error) {
+// It will panic if the value of Transmitter is nil.
+// This function calls Transmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
+func BeginRMACSession(transmitter Transmitter, keyProvider SessionKeyProvider, config RMACSessionConfiguration) (*RMACSession, error) {
 	if isNil(transmitter) {
 		panic("value of transmitter must not be nil")
 	}
 
-	macEncrypter, err := provider.keyProvider.GetKey(KeyIDMac, keyVersionNumber)
-	if err != nil {
-		return nil, errors.Wrap(err, "unable to retrieve encrypter for MAC key")
+	if isNil(keyProvider) {
+		panic("value of keyProvider must not be nil")
 	}
 
-	sessionRmac := [16]byte{}
+	rmac := [16]byte{}
 
-	err = deriveSessionKey(&sessionRmac, macEncrypter, [2]byte{0x01, 0x02}, sequenceCounter)
+	err := deriveSessionKey(
+		&rmac,
+		config.KeyVersionNumber,
+		KeyIDMac,
+		keyProvider,
+		[2]byte{0x01, 0x02},
+		uint16ToBytes(config.SequenceCounter))
+
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to derive RMAC")
 	}
 
-	tdes := resizeDoubleDESToTDES(sessionRmac)
-
 	session := &RMACSession{}
-	session.channelID = channelID
+	session.channelID = config.ChannelID
 
-	session.rmacTDESCipher, err = des.NewTripleDESCipher(tdes[:])
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create TripleDESCipher from RMAC")
-	}
-
-	capdu, err := beginRMACSession(p1, data)
+	capdu, err := beginRMACSession(config.P1, config.Data)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create BEGIN R-MAC SESSION command")
 	}
 
-	capdu.Cla = onLogicalChannel(channelID, capdu.Cla)
+	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err := transmitter.Transmit(capdu)
 	if err != nil {
@@ -355,4 +354,8 @@ func (provider *SessionProvider) BeginRMACSession(transmitter APDUTransmitter, c
 	}
 
 	return session, nil
+}
+
+func uint16ToBytes(u uint16) [2]byte {
+	return [2]byte{(byte)(u>>8) & 0xFF, (byte)(u & 0xFF)}
 }
