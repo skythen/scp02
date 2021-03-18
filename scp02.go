@@ -28,9 +28,10 @@ type Transmitter interface {
 
 // SessionKeyProvider is the interface that provides access to the cryptographic operation for session key derivation.
 type SessionKeyProvider interface {
-	// ProvideSessionKey uses Triple DES encryption in CBC mode for the derivation of session keys with src containing
-	// the derivation input Data (2B derivation constant | 2B sequence counter | 12B zero padding)
-	// and dst being used for storing the encryption result.
+	// ProvideSessionKey uses the static key with the given key ID and key version number with
+	// Triple DES encryption in CBC mode for the derivation of a session key.
+	// src contains the derivation input Data (2B derivation constant | 2B sequence counter | 12B zero padding)
+	// and dst is used for storing the encryption result.
 	ProvideSessionKey(keyID byte, kvn byte, dst *[16]byte, src [16]byte) error
 }
 
@@ -62,7 +63,7 @@ func (level SecurityLevel) Byte() byte {
 
 // Options represents implementation options of SCP02 that are encoded on the i-parameter.
 // Other options such as R-MAC support, the initiation mode or number of base keys are not configured via Options
-// but implicitly used e.g. by calling SessionProvider.InitiateChannelImplicit.
+// but implicitly used e.g. by calling InitiateChannelImplicit or InitiateChannelExplicit.
 type Options struct {
 	CMACOnUnmodifiedAPDU bool // true: C-MAC on unmodified APDU, false: C-MAC on modified APDU
 	ICVEncryptionForCMAC bool // true: ICV encryption for C-MAC session, false: No ICV encryption
@@ -70,28 +71,25 @@ type Options struct {
 
 // ImplicitInitiationConfiguration is the configuration for the implicit initiation of a Secure Channel Session.
 type ImplicitInitiationConfiguration struct {
-	SecurityLevel    SecurityLevel
-	Options          Options
-	KeyVersionNumber uint8
-	SequenceCounter  uint16
-	Capdu            apdu.Capdu
-	SelectedAid      []byte
+	SecurityLevel    SecurityLevel // security level that shall be used for the session
+	Options          Options       // i-parameter options
+	KeyVersionNumber uint8         // key version number of the key(s) to use
+	SequenceCounter  uint16        // current value of the sequence counter
+	Capdu            apdu.Capdu    // command APDU on which the initial C-MAC shall be calculated
+	SelectedAid      []byte        // AID of the currently selected application
 }
 
 // InitiateChannelImplicit uses implicit initiation to create a Secure Channel and returns a Session.
-// The function will panic if the value of Transmitter is nil.
-//
-// Please note that C-DEC is not supported for implicit initiation and will not be used if it was
-// provided with the Security Level in the SessionProvider Configuration.
+// Please note that security level C-DEC is not supported for implicit initiation and will lead to errors
+// if used.
 //
 // The Sequence Counter must be provided to derive the correct session keys. It is either implicitly known
 // or can be retrieved with a GET DATA command. The AID of the application that is currently selected on
 // the given channel is used for calculating the ICV for the first C-MAC (ICV MAC over AID).
 //
-// The first C-MAC is calculated on and appended to the given APDU which is then passed to
-// Transmitter.Transmit.
+// The first C-MAC is calculated on and appended to the given APDU which is then passed to Transmitter.Transmit.
 func InitiateChannelImplicit(config ImplicitInitiationConfiguration, transmitter Transmitter, keyProvider SessionKeyProvider) (*Session, error) {
-	if config.SelectedAid != nil && len(config.SelectedAid) < 5 || len(config.SelectedAid) > 16 {
+	if len(config.SelectedAid) < 5 || len(config.SelectedAid) > 16 {
 		return nil, errors.Errorf("invalid length of AID - must be in range 5-16 bytes, got: %d", len(config.SelectedAid))
 	}
 
@@ -105,42 +103,39 @@ func InitiateChannelImplicit(config ImplicitInitiationConfiguration, transmitter
 		config.Options)
 
 	session.selectedAID = config.SelectedAid
-	// C-DEC is not supported for implicit initiation
-	session.securityLevel.CDEC = false
-
-	session.sessionKeyProvider = keyProvider
+	session.keyProvider = keyProvider
 
 	err := session.deriveCMAC()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive C-MAC session key")
+		return nil, errors.Wrap(err, "derive C-MAC session key")
 	}
 
 	// pad Data
 	padded, err := Pad80(config.SelectedAid, 8, true)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to pad Data for CMAC calculation")
+		return nil, errors.Wrap(err, "pad Data for C-MAC calculation")
 	}
 
 	// calculate ICV Mac over AID
 	err = desFinalTDESMac(&session.icv, padded, session.keys.cmac, scp02ZeroIV)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to calculate CMAC with Single DES Final 3DES MAC")
+		return nil, errors.Wrap(err, "calculate C-MAC with Single DES Final 3DES MAC")
 	}
 
-	wrapped, err := session.wrapWithSecurityLevel(config.Capdu, session.securityLevel, true)
+	wrappedCmd, err := session.wrapWithSecurityLevel(config.Capdu, session.securityLevel, true)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to wrap CAPDU")
+		return nil, errors.Wrap(err, "wrap CAPDU")
 	}
 
-	wrapped.Cla = onLogicalChannel(channelID, wrapped.Cla)
+	wrappedCmd.Cla = onLogicalChannel(channelID, wrappedCmd.Cla)
 
-	resp, err := transmitter.Transmit(wrapped)
+	resp, err := transmitter.Transmit(wrappedCmd)
 	if err != nil {
-		return nil, errors.New("failed to transmit CAPDU")
+		return nil, errors.New("transmit CAPDU")
 	}
 
 	if !resp.IsSuccess() {
-		return nil, errors.Errorf("failed to transmit command with SW: %02X%02X", resp.SW1, resp.SW2)
+		return nil, errors.Errorf("transmit command returned non-success SW: %02X%02X", resp.SW1, resp.SW2)
 	}
 
 	session.incrementSequenceCounter()
@@ -148,16 +143,16 @@ func InitiateChannelImplicit(config ImplicitInitiationConfiguration, transmitter
 	// derive DEK and R-MAC after sequence counter incrementation
 	err = session.deriveDEK()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive DEK session key")
+		return nil, errors.Wrap(err, "derive DEK session key")
 	}
 
 	// since an R-MAC session can be initiated at any given time, derive R-MAC as well
 	err = session.deriveRMAC()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive R-MAC session key")
+		return nil, errors.Wrap(err, "derive R-MAC session key")
 	}
 
-	// check for RMAC
+	// check for R-MAC
 	if session.securityLevel.RMAC {
 		rmacSession := &RMACSession{
 			channelID:   session.channelID,
@@ -167,7 +162,7 @@ func InitiateChannelImplicit(config ImplicitInitiationConfiguration, transmitter
 			lock:        sync.Mutex{},
 		}
 
-		copy(rmacSession.ricv[:], wrapped.Data[len(wrapped.Data)-8:])
+		copy(rmacSession.ricv[:], wrappedCmd.Data[len(wrappedCmd.Data)-8:])
 		session.rmacSession = rmacSession
 	}
 
@@ -184,23 +179,29 @@ type ExplicitInitiationConfiguration struct {
 }
 
 // InitiateChannelExplicit uses implicit initiation to create a Secure Channel and returns a Session.
-// The function will panic if the value of Transmitter is nil.
-//
 // This function calls Transmitter.Transmit to transmit the INITIALIZE UPDATE and
 // EXTERNAL AUTHENTICATE CAPDUs and receive the RAPDUs.
 func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter Transmitter, keyProvider SessionKeyProvider) (*Session, error) {
 	kvn := config.KeyVersionNumber
 
-	capdu := initializeUpdate(kvn, config.HostChallenge)
+	capdu := apdu.Capdu{
+		Cla:  claGP,
+		Ins:  0x50,
+		P1:   kvn,
+		P2:   0x00,
+		Data: config.HostChallenge[:],
+		Ne:   apdu.MaxLenResponseDataStandard,
+	}
+
 	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err := transmitter.Transmit(capdu)
 	if err != nil {
-		return nil, errors.New("failed to transmit INITIALIZE UPDATE")
+		return nil, errors.New("transmit INITIALIZE UPDATE")
 	}
 
 	if !resp.IsSuccess() {
-		return nil, errors.Errorf("INITIALIZE UPDATE failed with SW: %02X%02X", resp.SW1, resp.SW2)
+		return nil, errors.Errorf("INITIALIZE UPDATE returned non-success SW: %02X%02X", resp.SW1, resp.SW2)
 	}
 
 	iur, err := parseSCP02InitializeUpdateResponse(resp.Data)
@@ -209,36 +210,36 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 	}
 
 	session := newSession(config.ChannelID, config.KeyVersionNumber, iur.SequenceCounter, config.SecurityLevel, config.Options)
-	session.sessionKeyProvider = keyProvider
+	session.keyProvider = keyProvider
 
 	// derive session keys
 	// ENC
 	err = session.deriveENC()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive session ENC")
+		return nil, errors.Wrap(err, "derive session ENC")
 	}
 
-	// CMAC
+	// C-MAC
 	err = session.deriveCMAC()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive C-MAC")
+		return nil, errors.Wrap(err, "derive C-MAC")
 	}
 
-	// RMAC
+	// R-MAC
 	err = session.deriveRMAC()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive R-MAC")
+		return nil, errors.Wrap(err, "derive R-MAC")
 	}
 
 	// DEK
 	err = session.deriveDEK()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive session DEK")
+		return nil, errors.Wrap(err, "derive session DEK")
 	}
 
 	cc, err := session.calculateCardCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to calculate card cryptogram on host")
+		return nil, errors.Wrap(err, "calculate card cryptogram on host")
 	}
 
 	// compare cryptogram presented by the card with own cryptogram
@@ -248,29 +249,29 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 
 	hc, err := session.calculateHostCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to calculate host cryptogram")
+		return nil, errors.Wrap(err, "calculate host cryptogram")
 	}
 
 	capdu, err = session.externalAuthenticate(hc)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to generate EXTERNAL AUTHENTICATE command")
+		return nil, errors.Wrap(err, "generate EXTERNAL AUTHENTICATE command")
 	}
 
 	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err = transmitter.Transmit(capdu)
 	if err != nil {
-		return nil, errors.New("failed to transmit EXTERNAL AUTHENTICATE")
+		return nil, errors.New("transmit EXTERNAL AUTHENTICATE")
 	}
 
 	if !resp.IsSuccess() {
-		return nil, errors.Errorf("EXTERNAL AUTHENTICATE failed with SW: %02X%02X", resp.SW1, resp.SW2)
+		return nil, errors.Errorf("EXTERNAL AUTHENTICATE returned non-success SW: %02X%02X", resp.SW1, resp.SW2)
 	}
 
 	session.externalAuthenticateCMAC = capdu.Data[8:]
 	session.incrementSequenceCounter()
 
-	// check for RMAC
+	// check for R-MAC
 	if session.securityLevel.RMAC {
 		rmacSession := &RMACSession{
 			channelID:   session.channelID,
@@ -296,21 +297,20 @@ type RMACSessionConfiguration struct {
 }
 
 // BeginRMACSession begins a R-MAC session and returns a RMACSession.
-// It will panic if the value of Transmitter is nil.
 // This function calls Transmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
 func BeginRMACSession(config RMACSessionConfiguration, transmitter Transmitter, keyProvider SessionKeyProvider) (*RMACSession, error) {
 	rmac := [16]byte{}
 
 	err := deriveSessionKey(
 		&rmac,
-		config.KeyVersionNumber,
 		KeyIDMac,
+		config.KeyVersionNumber,
 		keyProvider,
 		[2]byte{0x01, 0x02},
 		uint16ToBytes(config.SequenceCounter))
 
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to derive RMAC")
+		return nil, errors.Wrap(err, "derive R-MAC")
 	}
 
 	session := &RMACSession{}
@@ -318,14 +318,14 @@ func BeginRMACSession(config RMACSessionConfiguration, transmitter Transmitter, 
 
 	capdu, err := beginRMACSession(config.P1, config.Data)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create BEGIN R-MAC SESSION command")
+		return nil, errors.Wrap(err, "create BEGIN R-MAC SESSION command")
 	}
 
 	capdu.Cla = onLogicalChannel(config.ChannelID, capdu.Cla)
 
 	resp, err := transmitter.Transmit(capdu)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to transmit BEGIN R-MAC Session")
+		return nil, errors.Wrap(err, "transmit BEGIN R-MAC Session")
 	}
 
 	if !resp.IsSuccess() {
@@ -355,7 +355,7 @@ type Session struct {
 	sequenceCounter          [2]byte
 	securityLevel            SecurityLevel
 	options                  Options
-	sessionKeyProvider       SessionKeyProvider
+	keyProvider              SessionKeyProvider
 	keys                     sessionKeys
 	icv                      [8]byte
 	externalAuthenticateCMAC []byte
@@ -370,7 +370,7 @@ func newSession(channelID uint8, kvn uint8, sequenceCounter [2]byte, securityLev
 		sequenceCounter:          sequenceCounter,
 		options:                  options,
 		securityLevel:            securityLevel,
-		sessionKeyProvider:       nil,
+		keyProvider:              nil,
 		keys:                     sessionKeys{kvn: kvn},
 		icv:                      [8]byte{},
 		externalAuthenticateCMAC: nil,
@@ -397,20 +397,20 @@ func (session *Session) SequenceCounter() uint16 {
 
 // Wrap takes an apdu.Capdu and applies C-MAC and encryption according to the Session's SecurityLevel and returns the wrapped apdu.Capdu.
 func (session *Session) Wrap(capdu apdu.Capdu) (apdu.Capdu, error) {
+	session.lock.Lock()
+	defer session.lock.Unlock()
+
 	return session.wrapWithSecurityLevel(capdu, session.securityLevel, false)
 }
 
 func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLevel, firstCmd bool) (apdu.Capdu, error) {
-	session.lock.Lock()
-	defer session.lock.Unlock()
-
 	var (
 		cmac [8]byte
 		err  error
 	)
 
 	if level.RMAC {
-		// check for active RMAC session and update last command
+		// check for active R-MAC session and update last command
 		if session.rmacSession != nil {
 			session.rmacSession.UpdateLastCommand(capdu)
 		}
@@ -419,7 +419,7 @@ func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLe
 	if level.CMAC {
 		// check if wrapped capdu length would exceed maximum allowed length
 		if len(capdu.Data)+8 > 255 {
-			return apdu.Capdu{}, errors.New("capdu length with CMAC exceeds maximum allowed length ")
+			return apdu.Capdu{}, errors.New("capdu length with C-MAC exceeds maximum allowed length ")
 		}
 
 		// ICV encryption for C-MAC
@@ -428,7 +428,7 @@ func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLe
 
 			err = desECBEncrypt(encICV, session.icv[:], session.keys.cmacCipher)
 			if err != nil {
-				return apdu.Capdu{}, errors.Wrap(err, "failed to encrypt ICV with DES ECB")
+				return apdu.Capdu{}, errors.Wrap(err, "encrypt ICV with DES ECB")
 			}
 
 			// copy the value of the encrypted icv to the session icv
@@ -437,7 +437,7 @@ func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLe
 
 		cmac, err = session.calculateCMAC(capdu)
 		if err != nil {
-			return apdu.Capdu{}, errors.Wrap(err, "failed to calculate C-MAC")
+			return apdu.Capdu{}, errors.Wrap(err, "calculate C-MAC")
 		}
 
 		copy(session.icv[:], cmac[:])
@@ -447,7 +447,7 @@ func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLe
 	if level.CDEC && len(capdu.Data) != 0 {
 		encData, err := session.encryptDataField(capdu.Data)
 		if err != nil {
-			return apdu.Capdu{}, errors.Wrap(err, "failed to encrypt command Data field")
+			return apdu.Capdu{}, errors.Wrap(err, "encrypt command Data field")
 		}
 
 		capdu.Data = encData
@@ -473,7 +473,7 @@ func (session *Session) calculateCMAC(capdu apdu.Capdu) (cmac [8]byte, err error
 		capdu.Cla -= 0x4F
 	}
 
-	// remove le for CMAC calculation
+	// remove le for C-MAC calculation
 	capdu.Ne = 0
 
 	bCapdu := capdu.Bytes()
@@ -500,12 +500,12 @@ func (session *Session) calculateCMAC(capdu apdu.Capdu) (cmac [8]byte, err error
 	// calculate C-MAC
 	bCapdu, err = Pad80(bCapdu, 8, true)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to pad Data for CMAC calculation")
+		return [8]byte{}, errors.Wrap(err, "pad Data for C-MAC calculation")
 	}
 
 	err = desFinalTDESMac(&cmac, bCapdu, session.keys.cmac, session.icv)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to calculate CMAC with Single DES Final 3DES MAC")
+		return [8]byte{}, errors.Wrap(err, "calculate C-MAC with Single DES Final 3DES MAC")
 	}
 
 	return cmac, nil
@@ -514,7 +514,7 @@ func (session *Session) calculateCMAC(capdu apdu.Capdu) (cmac [8]byte, err error
 func (session *Session) encryptDataField(data []byte) (encData []byte, err error) {
 	data, err = Pad80(data, 8, true)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to pad Data for encryption")
+		return nil, errors.Wrap(err, "pad Data for encryption")
 	}
 
 	// use zero iv for encryption
@@ -539,7 +539,7 @@ func (session *Session) Unwrap(rapdu apdu.Rapdu) (apdu.Rapdu, error) {
 func (session *Session) EncryptDataWithDEK(dst []byte, src []byte) error {
 	err := tripleDESEcbEncrypt(dst, src, session.keys.dekTDES)
 	if err != nil {
-		return errors.Wrap(err, "failed to encrypt Data with TripleDES ECB")
+		return errors.Wrap(err, "encrypt Data with TripleDES ECB")
 	}
 
 	return nil
@@ -560,20 +560,9 @@ func (session *Session) MaximumCommandPayloadLength() int {
 	return d
 }
 
-func initializeUpdate(keyVersionNumber byte, hostChallenge [8]byte) apdu.Capdu {
-	return apdu.Capdu{
-		Cla:  claGP,
-		Ins:  0x50,
-		P1:   keyVersionNumber,
-		P2:   0x00,
-		Data: hostChallenge[:],
-		Ne:   apdu.MaxLenResponseDataStandard,
-	}
-}
-
 type keyInformation struct {
-	Version byte
-	SCPID   byte
+	version byte
+	scpID   byte
 }
 
 func parseSCP02InitializeUpdateResponse(b []byte) (*initializeUpdateResponse, error) {
@@ -591,10 +580,10 @@ func parseSCP02InitializeUpdateResponse(b []byte) (*initializeUpdateResponse, er
 	_ = copy(divData[:], b[:10])
 	_ = copy(counter[:], b[12:14])
 
-	keyInfo := keyInformation{Version: b[10], SCPID: b[11]}
+	keyInfo := keyInformation{version: b[10], scpID: b[11]}
 
-	if keyInfo.SCPID != 0x02 {
-		return nil, fmt.Errorf("scp ID must be 02, got %d", keyInfo.SCPID)
+	if keyInfo.scpID != 0x02 {
+		return nil, fmt.Errorf("scp ID must be 02, got %d", keyInfo.scpID)
 	}
 
 	_ = copy(challenge[:], b[14:20])
@@ -611,7 +600,7 @@ func parseSCP02InitializeUpdateResponse(b []byte) (*initializeUpdateResponse, er
 
 type initializeUpdateResponse struct {
 	KeyDiversificationData [10]byte       // key diversification Data is Data typically used by a backend system to derive the card static keys.
-	KeyInformation         keyInformation // key information includes the Version Number and the Secure Channel Protocol identifier
+	KeyInformation         keyInformation // key information includes the version Number and the Secure Channel Protocol identifier
 	SequenceCounter        [2]byte        // current value of the sequence counter used for session key derivation
 	CardChallenge          [6]byte        // random number generated by the card
 	CardCryptogram         [8]byte        // authentication cryptogram generated by the card
@@ -629,7 +618,7 @@ func (session *Session) externalAuthenticate(hostCryptogram [8]byte) (apdu.Capdu
 
 	wrappedAuthCmd, err := session.wrapWithSecurityLevel(authCmd, SecurityLevel{CMAC: true}, true)
 	if err != nil {
-		return apdu.Capdu{}, errors.Wrap(err, "failed to wrap EXTERNAL AUTHENTICATE command")
+		return apdu.Capdu{}, errors.Wrap(err, "wrap EXTERNAL AUTHENTICATE command")
 	}
 
 	return wrappedAuthCmd, nil
@@ -643,14 +632,14 @@ func (session *Session) calculateCardCryptogram(hc [8]byte, seqCounter [2]byte, 
 
 	data, err := Pad80(ccInput, 24, false)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to pad Data for 3DES MAC")
+		return [8]byte{}, errors.Wrap(err, "pad Data for 3DES MAC")
 	}
 
 	var cryptogram [8]byte
 
 	err = fullTDESMac(&cryptogram, data, session.keys.encTDESCipher, scp02ZeroIV)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to calculate 3DES MAC")
+		return [8]byte{}, errors.Wrap(err, "calculate 3DES MAC")
 	}
 
 	return cryptogram, nil
@@ -664,14 +653,14 @@ func (session *Session) calculateHostCryptogram(hc [8]byte, seqCounter [2]byte, 
 
 	data, err := Pad80(hcInput, len(hcInput)+8, false)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to pad Data for 3DES MAC")
+		return [8]byte{}, errors.Wrap(err, "pad Data for 3DES MAC")
 	}
 
 	var cryptogram [8]byte
 
 	err = fullTDESMac(&cryptogram, data, session.keys.encTDESCipher, scp02ZeroIV)
 	if err != nil {
-		return [8]byte{}, errors.Wrap(err, "failed to calculate 3DES MAC")
+		return [8]byte{}, errors.Wrap(err, "calculate 3DES MAC")
 	}
 
 	return cryptogram, nil
@@ -686,14 +675,14 @@ type sessionKeys struct {
 	encTDESCipher cipher.Block
 }
 
-func deriveSessionKey(dst *[16]byte, kvn, keyID byte, keyDerivator SessionKeyProvider, derivationConstant, sequenceCounter [2]byte) error {
+func deriveSessionKey(dst *[16]byte, keyID byte, kvn byte, keyDerivator SessionKeyProvider, derivationConstant, sequenceCounter [2]byte) error {
 	var derivationData [16]byte
 
 	copy(derivationData[:], append(derivationConstant[:], sequenceCounter[:]...))
 
-	err := keyDerivator.ProvideSessionKey(kvn, keyID, dst, derivationData)
+	err := keyDerivator.ProvideSessionKey(keyID, kvn, dst, derivationData)
 	if err != nil {
-		return errors.Wrap(err, "failed to apply TripleDES CBC encryption")
+		return errors.Wrap(err, "apply TripleDES CBC encryption")
 	}
 
 	return nil
@@ -704,16 +693,16 @@ func (session *Session) deriveCMAC() error {
 		derivedKey [16]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, session.keys.kvn, KeyIDMac, session.sessionKeyProvider, [2]byte{0x01, 0x01}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x01}, session.sequenceCounter)
 	if err != nil {
-		return errors.Wrap(err, "failed to derive S-CMAC")
+		return err
 	}
 
 	copy(session.keys.cmac[:], derivedKey[:])
 
 	session.keys.cmacCipher, err = des.NewCipher(derivedKey[:8])
 	if err != nil {
-		return errors.Wrap(err, "failed to create DES cipher from S-CMAC")
+		return errors.Wrap(err, "create DES cipher from C-MAC")
 	}
 
 	return nil
@@ -722,9 +711,9 @@ func (session *Session) deriveCMAC() error {
 func (session *Session) deriveRMAC() error {
 	var derivedKey [16]byte
 
-	err := deriveSessionKey(&derivedKey, session.keys.kvn, KeyIDMac, session.sessionKeyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
 	if err != nil {
-		return errors.Wrap(err, "failed to derive RMAC")
+		return err
 	}
 
 	copy(session.keys.rmac[:], derivedKey[:])
@@ -738,9 +727,9 @@ func (session *Session) deriveDEK() error {
 		tdesKey    [24]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, session.keys.kvn, KeyIDDek, session.sessionKeyProvider, [2]byte{0x01, 0x81}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDDek, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x81}, session.sequenceCounter)
 	if err != nil {
-		return errors.Wrap(err, "failed to derive S-DEK")
+		return err
 	}
 
 	tdesKey = resizeDoubleDESToTDES(derivedKey)
@@ -756,16 +745,16 @@ func (session *Session) deriveENC() error {
 		tdesKey    [24]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, session.keys.kvn, KeyIDEnc, session.sessionKeyProvider, [2]byte{0x01, 0x82}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDEnc, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x82}, session.sequenceCounter)
 	if err != nil {
-		return errors.Wrap(err, "failed to derive S-ENC")
+		return err
 	}
 
 	tdesKey = resizeDoubleDESToTDES(derivedKey)
 
 	session.keys.encTDESCipher, err = des.NewTripleDESCipher(tdesKey[:])
 	if err != nil {
-		return errors.Wrap(err, "failed to create TripleDES cipher from S-ENC")
+		return errors.Wrap(err, "create TripleDES cipher from S-ENC")
 	}
 
 	return nil
@@ -792,20 +781,14 @@ func (session *Session) incrementSequenceCounter() {
 // This function calls SessionKeyProvider.Encrypt on the encrypter for the MAC key, that was provided when creating Session, in order to derive the R-MAC key
 // and calls Transmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
 func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) error {
-	skipUnlock := false
-
 	session.lock.Lock()
-	defer func() {
-		if !skipUnlock {
-			session.lock.Unlock()
-		}
-	}()
+	defer session.lock.Unlock()
 
 	rmac := [16]byte{}
 
-	err := deriveSessionKey(&rmac, session.keys.kvn, KeyIDMac, session.sessionKeyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
+	err := deriveSessionKey(&rmac, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
 	if err != nil {
-		return errors.Wrap(err, "failed to derive RMAC")
+		return errors.Wrap(err, "derive R-MAC")
 	}
 
 	session.keys.rmac = rmac
@@ -814,27 +797,19 @@ func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) e
 
 	beginCmd, err := beginRMACSession(BeginRMACSessionP1RMAC, data)
 	if err != nil {
-		return errors.Wrap(err, "failed to create BEGIN R-MAC SESSION command")
+		return errors.Wrap(err, "create BEGIN R-MAC SESSION command")
 	}
 
-	session.lock.Unlock()
-
-	skipUnlock = true
-
-	wrappedBeginCmd, err := session.Wrap(beginCmd)
+	wrappedBeginCmd, err := session.wrapWithSecurityLevel(beginCmd, session.securityLevel, false)
 	if err != nil {
-		return errors.Wrap(err, "failed to wrap BEGIN R-MAC SESSION command")
+		return errors.Wrap(err, "wrap BEGIN R-MAC SESSION command")
 	}
-
-	session.lock.Lock()
-
-	skipUnlock = false
 
 	wrappedBeginCmd.Cla = onLogicalChannel(session.channelID, wrappedBeginCmd.Cla)
 
 	resp, err := transmitter.Transmit(wrappedBeginCmd)
 	if err != nil {
-		return errors.Wrap(err, "failed to transmit BEGIN R-MAC Session")
+		return errors.Wrap(err, "transmit BEGIN R-MAC Session")
 	}
 
 	if !resp.IsSuccess() {
@@ -847,13 +822,13 @@ func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) e
 		// pad Data
 		padded, err := Pad80(session.selectedAID, 8, true)
 		if err != nil {
-			return errors.Wrap(err, "failed to pad Data for CMAC calculation")
+			return errors.Wrap(err, "pad Data for C-MAC calculation")
 		}
 
-		// calculate the CMAC
+		// calculate the C-MAC
 		err = desFinalTDESMac(&rmacSession.ricv, padded, session.keys.rmac, scp02ZeroIV)
 		if err != nil {
-			return errors.Wrap(err, "failed to calculate CMAC with Single DES Final 3DES MAC")
+			return errors.Wrap(err, "calculate C-MAC with Single DES Final 3DES MAC")
 		}
 	}
 
@@ -865,14 +840,8 @@ func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) e
 // EndRMACSession ends an R-MAC session and/or retrieves the current R-MAC value depending on the value of endSession.
 // This function calls Transmitter.Transmit to transmit the END R-MAC SESSION CAPDU and receive the RAPDU.
 func (session *Session) EndRMACSession(transmitter Transmitter, endSession bool) (rmac []byte, err error) {
-	skipUnlock := false
-
 	session.lock.Lock()
-	defer func() {
-		if !skipUnlock {
-			session.lock.Unlock()
-		}
-	}()
+	defer session.lock.Unlock()
 
 	if session.rmacSession == nil {
 		return nil, errors.New("session has no active R-MAC session")
@@ -895,23 +864,16 @@ func (session *Session) EndRMACSession(transmitter Transmitter, endSession bool)
 		Ne:   apdu.MaxLenResponseDataStandard,
 	}
 
-	session.lock.Unlock()
-
-	skipUnlock = true
-
-	wrappedEndCmd, err := session.Wrap(endCmd)
+	wrappedEndCmd, err := session.wrapWithSecurityLevel(endCmd, session.securityLevel, false)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to wrap END R-MAC SESSION command")
+		return nil, errors.Wrap(err, "wrap END R-MAC SESSION command")
 	}
-
-	session.lock.Lock()
-	skipUnlock = false
 
 	wrappedEndCmd.Cla = onLogicalChannel(session.channelID, wrappedEndCmd.Cla)
 
 	resp, err := transmitter.Transmit(wrappedEndCmd)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to transmit END R-MAC Session")
+		return nil, errors.Wrap(err, "transmit END R-MAC Session")
 	}
 
 	if !resp.IsSuccess() {
@@ -981,7 +943,7 @@ func (rmacSession *RMACSession) End(transmitter Transmitter, endSession bool) ([
 
 	resp, err := transmitter.Transmit(endCmd)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to transmit END R-MAC Session")
+		return nil, errors.Wrap(err, "transmit END R-MAC Session")
 	}
 
 	if !resp.IsSuccess() {
@@ -1033,7 +995,7 @@ func (rmacSession *RMACSession) unwrapWithSecurityLevel(rapdu apdu.Rapdu) (apdu.
 	}
 
 	if rmacSession.lastCommand == nil {
-		return apdu.Rapdu{}, errors.New("no last command for RMAC calculation found - did you forget to call UpdateLastCommand?")
+		return apdu.Rapdu{}, errors.New("no last command for R-MAC calculation found - did you forget to call UpdateLastCommand?")
 	}
 
 	// get response Data without R-MAC
@@ -1063,23 +1025,23 @@ func (rmacSession *RMACSession) unwrapWithSecurityLevel(rapdu apdu.Rapdu) (apdu.
 	// pad input
 	rmacInput, err = Pad80(rmacInput, 8, true)
 	if err != nil {
-		return apdu.Rapdu{}, errors.Wrap(err, "failed to pad Data for RMAC calculation")
+		return apdu.Rapdu{}, errors.Wrap(err, "pad Data for R-MAC calculation")
 	}
 
 	var calculatedRMAC [8]byte
 
 	err = desFinalTDESMac(&calculatedRMAC, rmacInput, rmacSession.rmac, rmacSession.ricv)
 	if err != nil {
-		return apdu.Rapdu{}, errors.Wrap(err, "failed to calculate RMAC with Single DES with Final 3DES Mac")
+		return apdu.Rapdu{}, errors.Wrap(err, "calculate R-MAC with Single DES with Final 3DES Mac")
 	}
 
 	receivedRMAC := rapdu.Data[len(rapdu.Data)-8:]
 
 	if !bytes.Equal(calculatedRMAC[:], receivedRMAC) {
-		return apdu.Rapdu{}, fmt.Errorf("calculated RMAC on host (%02X) doesn't match the calculated RMAC of the card (%02X)", calculatedRMAC[:], receivedRMAC)
+		return apdu.Rapdu{}, fmt.Errorf("calculated R-MAC on host (%02X) doesn't match the calculated R-MAC of the card (%02X)", calculatedRMAC[:], receivedRMAC)
 	}
 
-	// RMAC is used as ICV for next calculation
+	// R-MAC is used as ICV for next calculation
 	copy(rmacSession.ricv[:], calculatedRMAC[:])
 
 	rapdu.Data = responseData
