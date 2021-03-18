@@ -7,18 +7,18 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Pad80 takes Data and a block size (must be a multiple of 8) and appends '80' and zero bytes to Data until
-// the length of the resulting []byte reaches a multiple of the block size and returns the padded Data.
-// If force is false, the padding will only be applied, if length of Data is not a multiple of the block size.
+// Pad80 takes bytes and a block size (must be a multiple of 8) and appends '80' and zero bytes until
+// the length reaches a multiple of the block size and returns the padded bytes.
+// If force is false, the padding will only be applied, if the length of bytes is not a multiple of the block size.
 // If force is true, the padding will be applied anyways.
-func Pad80(b []byte, blocksize int, force bool) ([]byte, error) {
-	if blocksize%8 != 0 {
+func Pad80(b []byte, blockSize int, force bool) ([]byte, error) {
+	if blockSize%8 != 0 {
 		return nil, errors.New("block size must be a multiple of 8")
 	}
 
-	rest := len(b) % blocksize
+	rest := len(b) % blockSize
 	if rest != 0 || force {
-		padded := make([]byte, len(b)+blocksize-rest)
+		padded := make([]byte, len(b)+blockSize-rest)
 		copy(padded, b)
 		padded[len(b)] = 0x80
 
