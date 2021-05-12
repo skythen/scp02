@@ -30,9 +30,10 @@ type Transmitter interface {
 type SessionKeyProvider interface {
 	// ProvideSessionKey uses the static key with the given key ID and key version number with
 	// Triple DES encryption in CBC mode for the derivation of a session key.
+	// diversificationData may be present to provide data for the derivation of card static keys.
 	// src contains the derivation input Data (2B derivation constant | 2B sequence counter | 12B zero padding)
 	// and dst is used for storing the encryption result.
-	ProvideSessionKey(keyID byte, kvn byte, dst *[16]byte, src [16]byte) error
+	ProvideSessionKey(keyID byte, kvn byte, diversificationData []byte, dst *[16]byte, src [16]byte) error
 }
 
 // SecurityLevel represents the security level options applicable for SCP02.
@@ -71,12 +72,13 @@ type Options struct {
 
 // ImplicitInitiationConfiguration is the configuration for the implicit initiation of a Secure Channel Session.
 type ImplicitInitiationConfiguration struct {
-	SecurityLevel    SecurityLevel // security level that shall be used for the session
-	Options          Options       // i-parameter options
-	KeyVersionNumber uint8         // key version number of the key(s) to use
-	SequenceCounter  uint16        // current value of the sequence counter
-	Capdu            apdu.Capdu    // command APDU on which the initial C-MAC shall be calculated
-	SelectedAid      []byte        // AID of the currently selected application
+	SecurityLevel       SecurityLevel // security level that shall be used for the session
+	Options             Options       // i-parameter options
+	KeyVersionNumber    uint8         // key version number of the key(s) to use
+	SequenceCounter     uint16        // current value of the sequence counter
+	Capdu               apdu.Capdu    // command APDU on which the initial C-MAC shall be calculated
+	SelectedAid         []byte        // AID of the currently selected application
+	DiversificationData []byte        // key diversification data
 }
 
 // InitiateChannelImplicit uses implicit initiation to create a Secure Channel and returns a Session.
@@ -211,6 +213,7 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 
 	session := newSession(config.ChannelID, config.KeyVersionNumber, iur.SequenceCounter, config.SecurityLevel, config.Options)
 	session.keyProvider = keyProvider
+	session.diversificationData = iur.KeyDiversificationData[:]
 
 	// derive session keys
 	// ENC
@@ -287,16 +290,17 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 	return session, nil
 }
 
-// ExplicitInitiationConfiguration is the configuration for the explicit initiation of a Secure Channel Session.
+// RMACSessionConfiguration is the configuration for the initiation of an RMACSession.
 type RMACSessionConfiguration struct {
-	ChannelID        uint8
-	P1               byte
-	Data             []byte
-	KeyVersionNumber uint8
-	SequenceCounter  uint16
+	ChannelID           uint8
+	P1                  byte
+	Data                []byte
+	KeyVersionNumber    uint8
+	SequenceCounter     uint16
+	diversificationData []byte
 }
 
-// BeginRMACSession begins a R-MAC session and returns a RMACSession.
+// BeginRMACSession begins an R-MAC session and returns RMACSession.
 // This function calls Transmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
 func BeginRMACSession(config RMACSessionConfiguration, transmitter Transmitter, keyProvider SessionKeyProvider) (*RMACSession, error) {
 	rmac := [16]byte{}
@@ -305,6 +309,7 @@ func BeginRMACSession(config RMACSessionConfiguration, transmitter Transmitter, 
 		&rmac,
 		KeyIDMac,
 		config.KeyVersionNumber,
+		config.diversificationData,
 		keyProvider,
 		[2]byte{0x01, 0x02},
 		uint16ToBytes(config.SequenceCounter))
@@ -359,6 +364,7 @@ type Session struct {
 	keys                     sessionKeys
 	icv                      [8]byte
 	externalAuthenticateCMAC []byte
+	diversificationData      []byte
 	selectedAID              []byte
 	rmacSession              *RMACSession
 	lock                     sync.Mutex
@@ -675,12 +681,12 @@ type sessionKeys struct {
 	encTDESCipher cipher.Block
 }
 
-func deriveSessionKey(dst *[16]byte, keyID byte, kvn byte, keyDerivator SessionKeyProvider, derivationConstant, sequenceCounter [2]byte) error {
+func deriveSessionKey(dst *[16]byte, keyID byte, kvn byte, diversificationData []byte, provider SessionKeyProvider, derivationConstant, sequenceCounter [2]byte) error {
 	var derivationData [16]byte
 
 	copy(derivationData[:], append(derivationConstant[:], sequenceCounter[:]...))
 
-	err := keyDerivator.ProvideSessionKey(keyID, kvn, dst, derivationData)
+	err := provider.ProvideSessionKey(keyID, kvn, diversificationData, dst, derivationData)
 	if err != nil {
 		return errors.Wrap(err, "apply TripleDES CBC encryption")
 	}
@@ -693,7 +699,7 @@ func (session *Session) deriveCMAC() error {
 		derivedKey [16]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x01}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x01}, session.sequenceCounter)
 	if err != nil {
 		return err
 	}
@@ -711,7 +717,7 @@ func (session *Session) deriveCMAC() error {
 func (session *Session) deriveRMAC() error {
 	var derivedKey [16]byte
 
-	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
 	if err != nil {
 		return err
 	}
@@ -727,7 +733,7 @@ func (session *Session) deriveDEK() error {
 		tdesKey    [24]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, KeyIDDek, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x81}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDDek, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x81}, session.sequenceCounter)
 	if err != nil {
 		return err
 	}
@@ -745,7 +751,7 @@ func (session *Session) deriveENC() error {
 		tdesKey    [24]byte
 	)
 
-	err := deriveSessionKey(&derivedKey, KeyIDEnc, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x82}, session.sequenceCounter)
+	err := deriveSessionKey(&derivedKey, KeyIDEnc, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x82}, session.sequenceCounter)
 	if err != nil {
 		return err
 	}
@@ -786,7 +792,7 @@ func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) e
 
 	rmac := [16]byte{}
 
-	err := deriveSessionKey(&rmac, KeyIDMac, session.keys.kvn, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
+	err := deriveSessionKey(&rmac, KeyIDMac, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x02}, session.sequenceCounter)
 	if err != nil {
 		return errors.Wrap(err, "derive R-MAC")
 	}
