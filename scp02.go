@@ -206,7 +206,7 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 		return nil, errors.Errorf("INITIALIZE UPDATE returned non-success SW: %02X%02X", resp.SW1, resp.SW2)
 	}
 
-	iur, err := parseSCP02InitializeUpdateResponse(resp.Data)
+	iur, err := parseInitializeUpdateResponse(resp.Data)
 	if err != nil {
 		return nil, errors.Wrap(err, "invalid INITIALIZE UPDATE response")
 	}
@@ -571,7 +571,7 @@ type keyInformation struct {
 	scpID   byte
 }
 
-func parseSCP02InitializeUpdateResponse(b []byte) (*initializeUpdateResponse, error) {
+func parseInitializeUpdateResponse(b []byte) (*initializeUpdateResponse, error) {
 	if len(b) != 28 {
 		return nil, fmt.Errorf("INITIALIZE UPDATE response must be 28 bytes long, got %d", len(b))
 	}
