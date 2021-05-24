@@ -143,7 +143,7 @@ func InitiateChannelImplicit(config ImplicitInitiationConfiguration, transmitter
 	session.incrementSequenceCounter()
 
 	// derive DEK and R-MAC after sequence counter incrementation
-	err = session.deriveDEK()
+	err = session.deriveSDEK()
 	if err != nil {
 		return nil, errors.Wrap(err, "derive DEK session key")
 	}
@@ -216,8 +216,8 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 	session.diversificationData = iur.KeyDiversificationData[:]
 
 	// derive session keys
-	// ENC
-	err = session.deriveENC()
+	// S-ENC
+	err = session.deriveSENC()
 	if err != nil {
 		return nil, errors.Wrap(err, "derive session ENC")
 	}
@@ -234,8 +234,8 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 		return nil, errors.Wrap(err, "derive R-MAC")
 	}
 
-	// DEK
-	err = session.deriveDEK()
+	// S-DEK
+	err = session.deriveSDEK()
 	if err != nil {
 		return nil, errors.Wrap(err, "derive session DEK")
 	}
@@ -540,9 +540,9 @@ func (session *Session) Unwrap(rapdu apdu.Rapdu) (apdu.Rapdu, error) {
 	return rapdu, nil
 }
 
-// EncryptDataWithDEK uses Triple DES in ECB mode for encrypting the given Data with the session DEK.
+// EncryptWithSDEK uses Triple DES in ECB mode for encrypting the given Data with the session DEK.
 // The length of src and dst must be a multiple of 8. If padding is required, it must be applied before calling the function.
-func (session *Session) EncryptDataWithDEK(dst []byte, src []byte) error {
+func (session *Session) EncryptWithSDEK(dst []byte, src []byte) error {
 	err := tripleDESEcbEncrypt(dst, src, session.keys.dekTDES)
 	if err != nil {
 		return errors.Wrap(err, "encrypt Data with TripleDES ECB")
@@ -727,7 +727,7 @@ func (session *Session) deriveRMAC() error {
 	return nil
 }
 
-func (session *Session) deriveDEK() error {
+func (session *Session) deriveSDEK() error {
 	var (
 		derivedKey [16]byte
 		tdesKey    [24]byte
@@ -745,7 +745,7 @@ func (session *Session) deriveDEK() error {
 	return nil
 }
 
-func (session *Session) deriveENC() error {
+func (session *Session) deriveSENC() error {
 	var (
 		derivedKey [16]byte
 		tdesKey    [24]byte
