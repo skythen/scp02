@@ -688,7 +688,7 @@ func deriveSessionKey(dst *[16]byte, keyID byte, kvn byte, diversificationData [
 
 	err := provider.ProvideSessionKey(keyID, kvn, diversificationData, dst, derivationData)
 	if err != nil {
-		return errors.Wrap(err, "apply TripleDES CBC encryption")
+		return errors.Wrap(err, "provide session key")
 	}
 
 	return nil
