@@ -784,7 +784,7 @@ func (session *Session) incrementSequenceCounter() {
 }
 
 // BeginRMACSession starts a R-MAC session. Data is used to specify the Data field of the BEGIN R-MAC SESSION command.
-// This function calls SessionKeyProvider.Encrypt on the encrypter for the MAC key, that was provided when creating Session, in order to derive the R-MAC key
+// This function calls SessionKeyProvider.ProvideSessionKey on the sessionKeyProvider for the MAC key, that was provided when creating Session, in order to derive the R-MAC key
 // and calls Transmitter.Transmit to transmit the BEGIN R-MAC SESSION CAPDU and receive the RAPDU.
 func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) error {
 	session.lock.Lock()
