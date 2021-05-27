@@ -240,7 +240,7 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 		return nil, errors.Wrap(err, "derive session DEK")
 	}
 
-	cc, err := session.calculateCardCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
+	cc, err := session.calculateCardCryptogram(config.HostChallenge, iur.CardChallenge)
 	if err != nil {
 		return nil, errors.Wrap(err, "calculate card cryptogram on host")
 	}
@@ -250,7 +250,7 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 		return nil, fmt.Errorf("calculated card cryptogram on host %02X doesn't match the calculated cryptogram of the card %02X", cc, iur.CardCryptogram)
 	}
 
-	hc, err := session.calculateHostCryptogram(config.HostChallenge, iur.SequenceCounter, iur.CardChallenge)
+	hc, err := session.calculateHostCryptogram(config.HostChallenge, iur.CardChallenge)
 	if err != nil {
 		return nil, errors.Wrap(err, "calculate host cryptogram")
 	}
@@ -388,6 +388,9 @@ func newSession(channelID uint8, kvn uint8, sequenceCounter [2]byte, securityLev
 
 // SecurityLevel returns the Security Level of the Session.
 func (session *Session) SecurityLevel() SecurityLevel {
+	session.lock.Lock()
+	defer session.lock.Unlock()
+
 	return session.securityLevel
 }
 
@@ -398,6 +401,9 @@ func (session *Session) ChannelID() uint8 {
 
 // SequenceCounter returns the session's value of the Sequence Counter.
 func (session *Session) SequenceCounter() uint16 {
+	session.lock.Lock()
+	defer session.lock.Unlock()
+
 	return binary.BigEndian.Uint16(session.sequenceCounter[:])
 }
 
@@ -447,26 +453,26 @@ func (session *Session) wrapWithSecurityLevel(capdu apdu.Capdu, level SecurityLe
 		}
 
 		copy(session.icv[:], cmac[:])
-	}
 
-	// command encryption
-	if level.CDEC && len(capdu.Data) != 0 {
-		encData, err := session.encryptDataField(capdu.Data)
-		if err != nil {
-			return apdu.Capdu{}, errors.Wrap(err, "encrypt command Data field")
+		// command encryption
+		if level.CDEC && len(capdu.Data) != 0 {
+			encData, err := session.encryptDataField(capdu.Data)
+			if err != nil {
+				return apdu.Capdu{}, errors.Wrap(err, "encrypt command Data field")
+			}
+
+			capdu.Data = encData
 		}
 
-		capdu.Data = encData
-	}
+		// append C-MAC after encryption
+		if level.CMAC {
+			capdu.Data = append(capdu.Data, cmac[:]...)
+		}
 
-	// append C-MAC after encryption
-	if level.CMAC {
-		capdu.Data = append(capdu.Data, cmac[:]...)
-	}
-
-	if level.CMAC || level.CDEC {
-		if (capdu.Cla & byte(0x04)) != 0x04 {
-			capdu.Cla += 0x04
+		if level.CMAC || level.CDEC {
+			if (capdu.Cla & byte(0x04)) != 0x04 {
+				capdu.Cla += 0x04
+			}
 		}
 	}
 
@@ -534,7 +540,7 @@ func (session *Session) encryptDataField(data []byte) (encData []byte, err error
 // Unwrap takes an apdu.Rapdu and verifies the R-MAC if an R-MAC session was started with Session and returns the unwrapped apdu.Rapdu.
 func (session *Session) Unwrap(rapdu apdu.Rapdu) (apdu.Rapdu, error) {
 	if session.rmacSession != nil {
-		return session.rmacSession.unwrapWithSecurityLevel(rapdu)
+		return session.rmacSession.unwrap(rapdu)
 	}
 
 	return rapdu, nil
@@ -630,10 +636,10 @@ func (session *Session) externalAuthenticate(hostCryptogram [8]byte) (apdu.Capdu
 	return wrappedAuthCmd, nil
 }
 
-func (session *Session) calculateCardCryptogram(hc [8]byte, seqCounter [2]byte, cc [6]byte) ([8]byte, error) {
+func (session *Session) calculateCardCryptogram(hc [8]byte, cc [6]byte) ([8]byte, error) {
 	ccInput := make([]byte, 0, 16)
 	ccInput = append(ccInput, hc[:]...)
-	ccInput = append(ccInput, seqCounter[:]...)
+	ccInput = append(ccInput, session.sequenceCounter[:]...)
 	ccInput = append(ccInput, cc[:]...)
 
 	data, err := Pad80(ccInput, 24, false)
@@ -651,13 +657,13 @@ func (session *Session) calculateCardCryptogram(hc [8]byte, seqCounter [2]byte, 
 	return cryptogram, nil
 }
 
-func (session *Session) calculateHostCryptogram(hc [8]byte, seqCounter [2]byte, cc [6]byte) ([8]byte, error) {
+func (session *Session) calculateHostCryptogram(hc [8]byte, cc [6]byte) ([8]byte, error) {
 	hcInput := make([]byte, 0, 16)
-	hcInput = append(hcInput, seqCounter[:]...)
+	hcInput = append(hcInput, session.sequenceCounter[:]...)
 	hcInput = append(hcInput, cc[:]...)
 	hcInput = append(hcInput, hc[:]...)
 
-	data, err := Pad80(hcInput, len(hcInput)+8, false)
+	data, err := Pad80(hcInput, 24, false)
 	if err != nil {
 		return [8]byte{}, errors.Wrap(err, "pad Data for 3DES MAC")
 	}
@@ -695,9 +701,7 @@ func deriveSessionKey(dst *[16]byte, keyID byte, kvn byte, diversificationData [
 }
 
 func (session *Session) deriveCMAC() error {
-	var (
-		derivedKey [16]byte
-	)
+	var derivedKey [16]byte
 
 	err := deriveSessionKey(&derivedKey, KeyIDMac, session.keys.kvn, session.diversificationData, session.keyProvider, [2]byte{0x01, 0x01}, session.sequenceCounter)
 	if err != nil {
@@ -768,9 +772,6 @@ func (session *Session) deriveSENC() error {
 
 // incrementSequenceCounter increments the Session sequenceCounter by 1.
 func (session *Session) incrementSequenceCounter() {
-	session.lock.Lock()
-	defer session.lock.Unlock()
-
 	if session.sequenceCounter[0] != 0x00 {
 		if session.sequenceCounter[1] < 0xFF {
 			session.sequenceCounter[1] += 0x01
@@ -845,12 +846,12 @@ func (session *Session) BeginRMACSession(transmitter Transmitter, data []byte) e
 
 // EndRMACSession ends an R-MAC session and/or retrieves the current R-MAC value depending on the value of endSession.
 // This function calls Transmitter.Transmit to transmit the END R-MAC SESSION CAPDU and receive the RAPDU.
-func (session *Session) EndRMACSession(transmitter Transmitter, endSession bool) (rmac []byte, err error) {
+func (session *Session) EndRMACSession(transmitter Transmitter, endSession bool) (apdu.Rapdu, error) {
 	session.lock.Lock()
 	defer session.lock.Unlock()
 
 	if session.rmacSession == nil {
-		return nil, errors.New("session has no active R-MAC session")
+		return apdu.Rapdu{}, errors.New("session has no active R-MAC session")
 	}
 
 	var p2 byte
@@ -872,27 +873,30 @@ func (session *Session) EndRMACSession(transmitter Transmitter, endSession bool)
 
 	wrappedEndCmd, err := session.wrapWithSecurityLevel(endCmd, session.securityLevel, false)
 	if err != nil {
-		return nil, errors.Wrap(err, "wrap END R-MAC SESSION command")
+		return apdu.Rapdu{}, errors.Wrap(err, "wrap END R-MAC SESSION command")
 	}
 
 	wrappedEndCmd.Cla = onLogicalChannel(session.channelID, wrappedEndCmd.Cla)
 
 	resp, err := transmitter.Transmit(wrappedEndCmd)
 	if err != nil {
-		return nil, errors.Wrap(err, "transmit END R-MAC Session")
+		return apdu.Rapdu{}, errors.Wrap(err, "transmit END R-MAC Session")
 	}
 
-	if !resp.IsSuccess() {
-		return nil, errors.Errorf("END R-MAC Session failed with SW: %02X%02X", resp.SW1, resp.SW2)
+	// check if r-mac is valid
+	unwrapped, err := session.rmacSession.unwrap(resp)
+	if err != nil {
+		return apdu.Rapdu{}, errors.Wrap(err, "unwrap END R-MAC Session")
 	}
 
-	rmac = resp.Data
-
-	if endSession {
-		session.rmacSession.lastCommand = nil
+	if unwrapped.IsSuccess() {
+		if endSession {
+			session.rmacSession.lastCommand = nil
+			session.rmacSession.ricv = [8]byte{}
+		}
 	}
 
-	return rmac, nil
+	return resp, nil
 }
 
 func beginRMACSession(p1 byte, data []byte) (apdu.Capdu, error) {
@@ -926,7 +930,7 @@ type RMACSession struct {
 
 // End ends an R-MAC session and/or retrieves the current R-MAC value depending on the value of endSession.
 // This function calls Transmitter.Transmit to transmit the END R-MAC SESSION CAPDU and receive the RAPDU.
-func (rmacSession *RMACSession) End(transmitter Transmitter, endSession bool) ([]byte, error) {
+func (rmacSession *RMACSession) End(transmitter Transmitter, endSession bool) (apdu.Rapdu, error) {
 	rmacSession.lock.Lock()
 	defer rmacSession.lock.Unlock()
 
@@ -949,19 +953,24 @@ func (rmacSession *RMACSession) End(transmitter Transmitter, endSession bool) ([
 
 	resp, err := transmitter.Transmit(endCmd)
 	if err != nil {
-		return nil, errors.Wrap(err, "transmit END R-MAC Session")
+		return apdu.Rapdu{}, errors.Wrap(err, "transmit END R-MAC Session")
 	}
 
-	if !resp.IsSuccess() {
-		return nil, errors.Errorf("END R-MAC Session failed with SW: %02X%02X", resp.SW1, resp.SW2)
+	// check if r-mac is valid
+	unwrapped, err := rmacSession.unwrap(resp)
+	if err != nil {
+		return apdu.Rapdu{}, errors.Wrap(err, "unwrap END R-MAC Session")
 	}
 
-	if endSession {
-		rmacSession.lastCommand = nil
-		rmacSession.ricv = [8]byte{}
+	if unwrapped.IsSuccess() {
+		if endSession {
+			rmacSession.lastCommand = nil
+			rmacSession.ricv = [8]byte{}
+		}
 	}
 
-	return resp.Data, nil
+	// return wrapped response
+	return resp, nil
 }
 
 // UpdateLastCommand updates the last command that was sent during the R-MAC session
@@ -992,10 +1001,7 @@ func (rmacSession *RMACSession) UpdateLastCommand(capdu apdu.Capdu) {
 	rmacSession.lastCommand = lastCmd
 }
 
-func (rmacSession *RMACSession) unwrapWithSecurityLevel(rapdu apdu.Rapdu) (apdu.Rapdu, error) {
-	rmacSession.lock.Lock()
-	defer rmacSession.lock.Unlock()
-
+func (rmacSession *RMACSession) unwrap(rapdu apdu.Rapdu) (apdu.Rapdu, error) {
 	if len(rapdu.Data) < 8 {
 		return apdu.Rapdu{}, fmt.Errorf("response length must be at least 8 bytes long, got %d", len(rapdu.Data))
 	}
