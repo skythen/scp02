@@ -265,7 +265,7 @@ func InitiateChannelExplicit(config ExplicitInitiationConfiguration, transmitter
 		level.CMAC = true
 	case CMACAndCDEC:
 		level.CMAC = true
-		level.RMAC = true
+		level.CDEC = true
 	case CMACAndRMAC:
 		level.CMAC = true
 		level.RMAC = true
