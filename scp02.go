@@ -442,13 +442,28 @@ func (session *Session) SequenceCounter() uint16 {
 	return binary.BigEndian.Uint16(session.sequenceCounter[:])
 }
 
-// EncryptWithSDEK uses Triple DES in ECB mode for encrypting the given Data with the session DEK.
+// EncryptWithSDEK uses Triple DES for explicitly instantiated sessions in ECB mode and for implicitly instantiated sessions in CBC mode for encrypting the given Data with the session DEK.
 // The length of src and dst must be a multiple of 8. If padding is required, it must be applied before calling the function.
 func (session *Session) EncryptWithSDEK(dst []byte, src []byte) error {
-	err := tripleDESEcbEncrypt(dst, src, session.keys.dekTDES)
-	if err != nil {
-		return errors.Wrap(err, "encrypt Data with TripleDES ECB")
+	// session has been explicitly initiated, use ECB
+	if session.externalAuthenticateCMAC != nil {
+		err := tripleDESEcbEncrypt(dst, src, session.keys.dekTDES)
+		if err != nil {
+			return errors.Wrap(err, "encrypt Data with TripleDES ECB")
+		}
+
+		return nil
 	}
+
+	// session has been implicitly initiated, use CBC
+	tdes, err := des.NewTripleDESCipher(session.keys.dekTDES[:]) //nolint:gosec
+	if err != nil {
+		return errors.Wrap(err, "create DES cipher from S-DEK")
+	}
+
+	// encrypt derivation Data with triple DES cipher
+	tDesCbcEnc := cipher.NewCBCEncrypter(tdes, scp02ZeroIV[:])
+	tDesCbcEnc.CryptBlocks(dst[:], src[:])
 
 	return nil
 }
